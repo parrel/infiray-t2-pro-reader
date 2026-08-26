@@ -1,0 +1,5 @@
+numpy>=1.20
+pillow>=9.0
+# Optional: prebuilt libusb-1.0, mainly for Windows.  On macOS/Linux the system
+# library (brew install libusb / apt install libusb-1.0-0) is found first.
+# libusb-package>=1.0.26

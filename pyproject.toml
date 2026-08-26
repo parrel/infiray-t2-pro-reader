@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "t2pro"
+version = "0.1.0"
+description = "Read and control the InfiRay T2 Pro thermal camera (iOS/MFi variant)"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "parrel" }]
+requires-python = ">=3.8"
+dependencies = ["numpy>=1.20", "pillow>=9.0"]
+
+[project.optional-dependencies]
+# Prebuilt libusb-1.0 binaries, for platforms where installing it system-wide
+# is awkward (mainly Windows).  Elsewhere the system libusb is found first.
+libusb = ["libusb-package>=1.0.26"]
+
+[project.scripts]
+t2pro = "t2pro.__main__:main"
+
+[tool.setuptools]
+packages = ["t2pro"]
