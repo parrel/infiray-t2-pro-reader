@@ -22,7 +22,8 @@ all.
     brew install libusb            # macOS; apt install libusb-1.0-0 on Debian/Ubuntu
 
 On Windows, install the optional prebuilt libusb with `pip install .[libusb]`
-and bind WinUSB to the InfiRay interface with [Zadig](https://zadig.akeo.ie/).
+and bind WinUSB to the InfiRay interface with [Zadig](https://zadig.akeo.ie/). (Not tested)
+
 On Linux, grant access with a udev rule and replug:
 
     echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="04b4", ATTR{idProduct}=="000a", MODE="0666", TAG+="uaccess"' \
@@ -31,8 +32,7 @@ On Linux, grant access with a udev rule and replug:
 
 ## Library
 
-The library is the point of this project; it depends on numpy and libusb only,
-and never touches HTTP.
+Depends on numpy and libusb only.
 
 ```python
 from t2pro import T2Pro, palettes
@@ -55,8 +55,7 @@ word, which is how the unverified registers can be probed.
 
 ## Server
 
-A proof-of-concept viewer built on the library. `t2pro/server.py` is the only
-module that knows about HTTP, and nothing in the library imports it.
+A proof-of-concept viewer built on the library, in `t2pro/server.py`.
 
     t2pro                          # or: python -m t2pro
 
@@ -111,125 +110,36 @@ cam.auto.stop()    # / .start()
 cam.busy           # True while the shutter is closed
 ```
 
-### Why it is a schedule and not a trigger
+## Residual shading
 
-Firing only when a correction is *needed* would be better, but measured on this
-hardware there is no signal to trigger on:
-
-- **No temperature register.** The UVC variants of this sensor family report a
-  shutter and a core temperature in their metadata rows, which is the natural
-  trigger. This MFi variant does not. Across two cold plug-ins the only metadata
-  words that move are row 192 words 0 and 1 — the frame mean and max, i.e. the
-  scene — plus word 16, which dithers between 15816 and 15818. Rows 193-195 are
-  static calibration blobs.
-- **No image proxy survives the scene.** Frame mean tracks drift well on a
-  *static* scene (0.43 counts of reference drift per count of mean change), but
-  ordinary scene motion moves it 823 counts — far more than any drift. Column
-  parity is 7x quieter, yet still moves 7.2 counts with the scene against 1.9
-  counts of total warm-up travel; regressing out its scene dependence leaves an
-  SNR of 1.5.
-- **There is no "grain" to threshold on.** Nearly all the drift is a uniform DC
-  shift (-27.98 counts of a 28.46 RMS move over the first 20 s), and `correct()`
-  already cancels DC by adding `reference.mean()` back. The *structured* part
-  that actually degrades the image saturates — 5.2 counts RMS after 20 s, 7.0
-  after 40 s, then flat out to five minutes — and it is low spatial frequency,
-  exactly where scene content lives.
-
-The schedule is therefore dense over the first minute, where that structured
-error accrues, and backs off afterwards.
-
-## Why a flat scene looks patterned and grainy
-
-Point the camera at a wall, or put the cap on, and the picture is a smooth
-blotchy pattern crawling with grain. Neither is a shutter problem — measured
-on hardware right after a fresh FFC:
-
-| component                                | counts RMS |
-|------------------------------------------|-----------:|
-| temporal (frame-to-frame) noise           |       2.5  |
-| high-frequency fixed pattern, post-FFC    |       2.1  |
-| **smooth residual shading, post-FFC**     |   **16.5** |
-
-So the shutter is doing its job: subtract an 8x8 local mean from the corrected
-frame and only 2.1 counts survive, which is the noise floor. The FFC also
-repeats — two closed-shutter references taken a minute apart differ by 2.4
-counts RMS, again just noise. And it is not a gain error either; regressing the
-residual on the reference explains 1% of its variance.
-
-What is left is **in front of the shutter**. The shutter sits behind the lens,
-so a closed-shutter reference only ever sees the sensor; lens shading,
-narcissus and the barrel's own thermal gradient are identical with the shutter
-open or closed and survive the subtraction untouched. That residual is 86
-counts peak to peak, smooth, and stable (correlation 0.99 across captures
-minutes apart).
-
-The grain is then a **rendering** effect on top of it. `normalize()` autoscales
-each frame to its own 1st-99th percentiles, and on a flat scene that window is
-only 67.6 counts wide — almost all of it the shading. So the palette gets
-stretched across the pattern, and 2.5 counts of noise land 9.5 grey levels
-apart. Real scenes span hundreds to thousands of counts and never show this.
+Point the camera at a wall and the picture is a smooth blotchy pattern crawling
+with grain. That is not a shutter problem: the shutter sits behind the lens, so
+lens shading, narcissus and the barrel's own thermal gradient are identical
+open or closed and survive the FFC untouched. On a flat scene the autoscaler
+then stretches the palette across that pattern, which is what makes the noise
+look like grain.
 
 Two fixes, both on by default:
 
 - **`cam.capture_shading()`** (the *Learn shading* button, `POST /shading`).
   Aim at something uniform — cap on, or a blank wall — and it averages 40
-  corrected frames, keeps only spatial frequencies broader than ~13 px, and
-  subtracts that from every later frame. Measured: fixed pattern 22.2 → 1.63
-  counts RMS, below the noise floor. Blurring is what keeps it safe: it cannot
-  eat per-pixel FPN, and a capture over a non-uniform scene costs a soft
-  gradient rather than a burned-in ghost. `POST /shading?clear=1` drops it.
+  corrected frames, keeps only the low spatial frequencies, and subtracts that
+  from every later frame. Learn it once; recapture only after a lens change or
+  a big ambient shift. `POST /shading?clear=1` drops it.
 - **A contrast floor** (`--floor`, default 150 counts). The autoscaler will not
   open a window narrower than this, so a scene with no real thermal contrast
-  renders flat instead of being amplified to full palette. This matters *more*
-  once shading correction is on: it drops the flat-scene span to 13.9 counts,
-  which without a floor would amplify the noise five times harder than before.
-
-### Does the shading profile survive later FFCs?
-
-Yes — and the FFCs help rather than hurt. Measured on a thermally settled
-camera, residual RMS on a uniform scene after learning a profile:
-
-| arm                                  | residual over the run |
-|--------------------------------------|-----------------------|
-| A: no FFC at all, 180 s              | 1.7 → 4.6 counts      |
-| B: six FFCs ~5 s apart               | 4.8 → 2.1 counts      |
-| C: quiet 90 s after B, then one FFC  | 2.6 → 8.6, then 3.8   |
-
-Arm A rules out the FFC as the cause: with no shutter events at all the
-residual still climbs, so what drifts is elapsed time. Arm B shows the shutter
-*correcting* that drift back down, and arm C shows it returning the moment the
-corrections stop and collapsing again on the next one. This is the ordinary
-sensor-offset drift `AutoFFC` exists to chase, riding on top of a shading
-profile that is not itself moving.
-
-The profile stays valid across all of it. Re-learning after a burst of six
-FFCs produces a profile differing from the original by only 4.9 counts RMS out
-of 16.6 — about 91% of the correction unchanged — and that 4.9 is the same
-size as the between-FFC drift, i.e. it is the drift being absorbed rather than
-the shading having shifted. So learn it once and leave it; keep auto-FFC on and
-the residual sits at 2-4 counts, near the 2.5-count noise floor. Recapture only
-after a lens change or a big ambient shift.
+  renders flat instead of being amplified to full palette.
 
 ## Sharpness
 
-192x256 is the real sensor resolution, so the only thing that can be done for
-apparent sharpness is to resample well:
+192x256 is the real sensor resolution, so all that can be done is to resample
+well. The intensity is upscaled first and the palette looked up afterwards, so
+every output pixel is an exact palette entry rather than a blend of two.
+`--interp` picks the filter (default `lanczos`, which keeps edges crisper than
+bicubic or bilinear).
 
-- **Upscale the intensity, then look up the palette.** Interpolating palettised
-  colour blends entries that are not on the palette curve — halfway between
-  ironbow's purple and orange is a grey that means no temperature at all — and
-  costs three channels of resampling to get a worse answer. Normalising to
-  8-bit intensity first, resizing that, and applying the LUT last keeps every
-  output pixel an exact palette entry.
-- **A real resampling filter** (`--interp`, default `lanczos`). NEAREST is what
-  makes an upscaled thermal image look blocky. LANCZOS keeps edges crisp where
-  BILINEAR and BICUBIC go soft, and its ringing is bounded by the uint8 clamp
-  either side of an edge.
-
-There is deliberately **no unsharp mask**. Applied in raw counts before the
-palette it is in the right place, but with no sub-pixel detail to recover all
-it reliably does is lift the 2.5 counts RMS of per-pixel noise, which reads as
-grain rather than sharpness.
+There is deliberately no unsharp mask: with no sub-pixel detail to recover it
+would only lift the per-pixel noise, which reads as grain rather than sharpness.
 
 ## Protocol
 
